@@ -7,6 +7,6 @@ if (!supabaseUrl || !supabaseAnonKey) {
   throw new Error("Missing SUPABASE_URL or SUPABASE_PUBLISHABLE_KEY in environment variables.");
 }
 
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+const supabase = createClient(supabaseUrl, process.env.SUPABASE_SERVICE_KEY);
 
 export default supabase;

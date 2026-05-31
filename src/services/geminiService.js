@@ -1,39 +1,89 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Groq from "groq-sdk";
+import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const EXTRACTION_PROMPT = `Return ONLY valid JSON, no markdown, no explanation. Fields:
-- vendor_name (string)
-- amount (number)
-- invoice_date (YYYY-MM-DD)
-- gst_number (string or null)
-- line_items (array of { description, qty, unit_price, total })
-- confidence (0 to 1)
+const EXTRACT_PROMPT = `You are an Indian GST invoice data extractor.
+Return ONLY valid JSON, no markdown, no explanation, no code blocks.
 
-Return null for missing fields.`;
+Fields to extract:
+- vendor_name: string (supplier/seller company name)
+- vendor_gstin: string (supplier GST number, 15 chars)
+- buyer_gstin: string (recipient GST number, 15 chars)
+- amount: number (final total invoice value including all taxes)
+- taxable_amount: number (amount before GST)
+- cgst: number or null
+- sgst: number or null
+- igst: number or null
+- gst_rate: number (percentage e.g. 18)
+- invoice_date: string (YYYY-MM-DD format)
+- invoice_number: string
+- hsn_sac: string (HSN or SAC code)
+- description: string (item or service description)
+- line_items: array of {description, hsn_sac, qty, unit_price, cgst, sgst, igst, total}
+- place_of_supply: string
+- is_igst: boolean
+- confidence_score: number between 0 and 1
 
-/**
- * Extract structured invoice data from a file buffer using Gemini Flash 1.5.
- * @param {Buffer} fileBuffer - The raw file bytes
- * @param {string} mimeType   - e.g. "application/pdf", "image/jpeg", "image/png"
- * @returns {Promise<Object>} Parsed invoice JSON
- */
+Return null for missing fields. Never guess.`;
+
 export async function extractInvoice(fileBuffer, mimeType) {
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  let textContent = null;
 
-  const filePart = {
-    inlineData: {
-      data: fileBuffer.toString("base64"),
-      mimeType,
-    },
-  };
+  // Extract text from PDF
+  if (mimeType === "application/pdf") {
+    try {
+      const loadingTask = getDocument({ data: new Uint8Array(fileBuffer) });
+      const pdfDoc = await loadingTask.promise;
+      const pages = [];
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const content = await page.getTextContent();
+        pages.push(content.items.map((item) => item.str).join(" "));
+      }
+      textContent = pages.join("\n");
+      console.log(`✓ PDF text extracted (${textContent.length} chars)`);
+    } catch (err) {
+      throw new Error(`PDF text extraction failed: ${err.message}`);
+    }
+  }
 
-  const result = await model.generateContent([EXTRACTION_PROMPT, filePart]);
-  const text = result.response.text();
+  if (!textContent) {
+    throw new Error("Only PDF invoices supported. Please upload a PDF.");
+  }
 
-  // Strip any accidental markdown fences before parsing
-  const clean = text.replace(/```json|```/gi, "").trim();
+  console.log("Calling Groq API...");
 
-  const parsed = JSON.parse(clean);
-  return parsed;
+  const response = await client.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    max_tokens: 1024,
+    temperature: 0,
+    messages: [
+      {
+        role: "system",
+        content: "You are a precise invoice data extractor. Always return only valid JSON with no extra text.",
+      },
+      {
+        role: "user",
+        content: `${EXTRACT_PROMPT}\n\nInvoice text:\n\n${textContent}`,
+      },
+    ],
+  });
+
+  const content = response.choices[0]?.message?.content;
+  if (!content) throw new Error("No content returned from Groq");
+
+  const cleaned = content
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    console.log(`✓ Success: ${parsed.vendor_name} | ₹${parsed.amount}`);
+    return parsed;
+  } catch {
+    throw new Error(`Failed to parse JSON: ${content}`);
+  }
 }

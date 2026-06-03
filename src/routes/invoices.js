@@ -9,7 +9,7 @@
 import { Router } from "express";
 import multer from "multer";
 import { extractInvoice } from "../services/geminiService.js";
-import { findOrCreateVendor, calculateTDS, updateTDSLedger, getFYFromDate } from "../services/vendorService.js";
+import { findOrCreateVendor, calculateTDS, updateTDSLedger, getFYFromDate } from "../services/vendorServices.js";
 import supabase from "../config/supabase.js";
 
 const router = Router();

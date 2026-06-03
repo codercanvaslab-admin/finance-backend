@@ -1,4 +1,4 @@
-// src/services/vendorService.js
+// src/services/vendorServices.js
 // ─────────────────────────────────────────────────────────────
 // Auto-matches or creates a vendor by GSTIN/company name.
 // Calculates TDS based on section, threshold, and FY ledger.
@@ -38,7 +38,7 @@ export function getFYFromDate(dateStr) {
     }
 }
 
-// ── 1. Vendor matching ────────────────────────────────────────
+// ── 1. Vendor matching ──────────────────────────────────────
 
 /**
  * Finds existing vendor by GSTIN, or creates a new one.

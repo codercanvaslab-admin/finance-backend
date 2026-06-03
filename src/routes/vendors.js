@@ -229,7 +229,7 @@ router.get("/tds-sections", async (req, res) => {
         const { data, error } = await supabase
             .from("tds_sections")
             .select("*")
-            .eq("is_active", true)
+            .neq("is_active", false)
             .order("section", { ascending: true });
 
         if (error) return res.status(500).json({ error: error.message });

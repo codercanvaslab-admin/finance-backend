@@ -9,7 +9,7 @@ const PORT = process.env.PORT ?? 3000;
 
 // ── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:4173', 'http://localhost:3000'],
+  origin: ['http://localhost:5173', 'http://localhost:4173', 'http://localhost:3000', 'https://finance-dv19xdg2y-codercanvaslab-projects.vercel.app/'],
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));

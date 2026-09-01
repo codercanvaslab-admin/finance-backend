@@ -1,41 +1,10 @@
 // src/services/taxValidation.js
-// ─────────────────────────────────────────────────────────────
-// This is the missing "deterministic safety-check" piece.
-//
-// THE PROBLEM THIS FIXES:
-// Right now, the AI extracts `is_igst`, `cgst`, `sgst`, and `igst`
-// directly from the invoice text/image — nothing independently
-// verifies that against the actual GSTIN state codes. If the AI
-// misreads a digit or mis-infers the tax type, nothing catches it.
-//
-// THE FIX:
-// GSTIN structure is public and fixed: the FIRST 2 DIGITS of any
-// GSTIN are a state code (e.g. "27" = Maharashtra, "09" = Uttar
-// Pradesh — see the official state-code list). This function
-// compares the vendor's state code against the buyer's (client's)
-// state code — plain string comparison, zero AI — and checks that
-// against what the AI said the tax type was.
-//
-// Example:
-//   vendor_gstin: "27AABCM1234F1Z5"  → state code "27" (Maharashtra)
-//   buyer_gstin:  "09XYZAB5678H1Z3"  → state code "09" (Uttar Pradesh)
-//   → codes differ → this should be IGST.
-//   If the AI's extracted `is_igst` was `false` (i.e. it thought this
-//   was CGST+SGST) → MISMATCH → flag for human review, don't trust it.
-// ─────────────────────────────────────────────────────────────
-
-/**
- * @param {object} invoice - fields as extracted by the AI (extractionService.js output)
- * @returns {object} validation result — always returned, never throws,
- *   so this can run on every invoice without breaking the pipeline.
- */
-export function validateTaxType(invoice) {
+export function validateTaxType(invoice, rawText = "") {
   const { vendor_gstin, buyer_gstin, is_igst, cgst, sgst, igst, amount, taxable_amount } = invoice;
 
   const flags = [];
   let expectedIsIgst = null;
 
-  // ── Check 1: Do we even have both GSTINs to compare? ─────────
   const vendorStateCode = extractStateCode(vendor_gstin);
   const buyerStateCode = extractStateCode(buyer_gstin);
 
@@ -45,7 +14,6 @@ export function validateTaxType(invoice) {
       message: "Could not independently verify CGST/SGST vs IGST — vendor or buyer GSTIN missing/invalid. Needs manual check.",
     });
   } else {
-    // ── Check 2: The actual deterministic comparison ────────────
     expectedIsIgst = vendorStateCode !== buyerStateCode;
 
     if (is_igst !== null && is_igst !== undefined && is_igst !== expectedIsIgst) {
@@ -58,13 +26,31 @@ export function validateTaxType(invoice) {
     }
   }
 
-  // ── Check 3: Math balance check (Subtotal + Tax = Total) ────
+  // ── Check 5: cross-check against literal "Supplier/Recipient State Code" labels ──
+  // Catches vendor/buyer GSTIN swaps — this is what would have caught the Info Edge bug.
+  if (rawText) {
+    const supplierMatch = rawText.match(/Supplier\s*State\s*Code\s*:?\s*(\d{2})/i);
+    const recipientMatch = rawText.match(/Re[cs]{1,2}i?pient\s*State\s*[Cc]ode\s*[-:]?\s*(\d{2})/i);
+
+    if (supplierMatch && vendorStateCode && supplierMatch[1] !== vendorStateCode) {
+      flags.push({
+        code: "VENDOR_GSTIN_STATE_MISMATCH",
+        message: `Invoice text states Supplier State Code = ${supplierMatch[1]}, but vendor_gstin's state code is ${vendorStateCode}. vendor_gstin may have been misread or swapped with the buyer's GSTIN.`,
+      });
+    }
+    if (recipientMatch && buyerStateCode && recipientMatch[1] !== buyerStateCode) {
+      flags.push({
+        code: "BUYER_GSTIN_STATE_MISMATCH",
+        message: `Invoice text states Recipient State Code = ${recipientMatch[1]}, but buyer_gstin's state code is ${buyerStateCode}. buyer_gstin may have been misread or swapped with the vendor's GSTIN.`,
+      });
+    }
+  }
+
+  // ── Check 3: Math balance check ──
   if (taxable_amount != null && amount != null) {
     const totalTax = (Number(cgst) || 0) + (Number(sgst) || 0) + (Number(igst) || 0);
     const expectedTotal = Number(taxable_amount) + totalTax;
     const diff = Math.abs(expectedTotal - Number(amount));
-
-    // Allow ₹1 tolerance for rounding
     if (diff > 1) {
       flags.push({
         code: "MATH_MISMATCH",
@@ -74,7 +60,7 @@ export function validateTaxType(invoice) {
     }
   }
 
-  // ── Check 4: CGST should equal SGST (they're always split evenly) ──
+  // ── Check 4: CGST should equal SGST ──
   if (cgst != null && sgst != null && Number(cgst) !== Number(sgst)) {
     flags.push({
       code: "CGST_SGST_MISMATCH",
@@ -91,11 +77,6 @@ export function validateTaxType(invoice) {
   };
 }
 
-/**
- * Extracts the 2-digit state code from a GSTIN.
- * Returns null if the GSTIN is missing or clearly malformed
- * (a valid GSTIN is always exactly 15 characters).
- */
 function extractStateCode(gstin) {
   if (!gstin || typeof gstin !== "string") return null;
   const cleaned = gstin.trim().toUpperCase();

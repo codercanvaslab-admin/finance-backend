@@ -46,21 +46,24 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
 
     // 1. Extract invoice fields via AI (now routes to text OR vision automatically)
     console.log("Step 1: Extracting invoice data...");
-    const ex = await extractInvoice(buffer, mimetype); // CHANGED
+    const ex = await extractInvoice(buffer, mimetype);
 
     // 2. CHANGED — Independent, deterministic tax-type + math validation
     console.log("Step 2: Validating tax type and math...");
-    const validation = validateTaxType(ex);
+    const validation = validateTaxType(ex, ex._source_text || "");
     if (!validation.passed) {
       console.warn("Tax validation flags:", validation.flags.map((f) => f.code).join(", "));
     }
 
+    // Strip the large source text before storing raw_data
+    const { _source_text, ...exForStorage } = ex;
+
     // 3. Auto-match or create vendor
     console.log("Step 3: Matching vendor...");
-    const { vendor, isNew } = await findOrCreateVendor(ex);
+    const { vendor, isNew } = await findOrCreateVendor(exForStorage);
 
     // 4. Build invoice record (no TDS yet — finance team picks section on review)
-    const fy = getFYFromDate(ex.invoice_date);
+    const fy = getFYFromDate(exForStorage.invoice_date);
 
     // CHANGED — if the model's own confidence was high but our independent
     // check found a problem, don't let the high AI confidence silently win.
@@ -70,35 +73,35 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
     const record = {
       // Core
       vendor_id: vendor.id,
-      vendor_name: ex.vendor_name ?? null,
-      vendor_gstin: ex.vendor_gstin ?? null,
-      buyer_gstin: ex.buyer_gstin ?? null,
-      amount: ex.amount != null ? Number(ex.amount) : null,
-      taxable_amount: ex.taxable_amount != null ? Number(ex.taxable_amount) : null,
-      invoice_date: ex.invoice_date ?? null,
+      vendor_name: exForStorage.vendor_name ?? null,
+      vendor_gstin: exForStorage.vendor_gstin ?? null,
+      buyer_gstin: exForStorage.buyer_gstin ?? null,
+      amount: exForStorage.amount != null ? Number(exForStorage.amount) : null,
+      taxable_amount: exForStorage.taxable_amount != null ? Number(exForStorage.taxable_amount) : null,
+      invoice_date: exForStorage.invoice_date ?? null,
       invoice_number: ex.invoice_number ?? null,
       financial_year: fy,
 
       // GST
-      gst_number: ex.vendor_gstin ?? null,
-      cgst: ex.cgst != null ? Number(ex.cgst) : null,
-      sgst: ex.sgst != null ? Number(ex.sgst) : null,
-      igst: ex.igst != null ? Number(ex.igst) : null,
-      gst_rate: ex.gst_rate != null ? Number(ex.gst_rate) : null,
-      is_igst: ex.is_igst ?? null,
-      place_of_supply: ex.place_of_supply ?? null,
-      hsn_sac: ex.hsn_sac ?? null,
-      description: ex.description ?? null,
-      line_items: ex.line_items ?? null,
+      gst_number: exForStorage.vendor_gstin ?? null,
+      cgst: exForStorage.cgst != null ? Number(exForStorage.cgst) : null,
+      sgst: exForStorage.sgst != null ? Number(exForStorage.sgst) : null,
+      igst: exForStorage.igst != null ? Number(exForStorage.igst) : null,
+      gst_rate: exForStorage.gst_rate != null ? Number(exForStorage.gst_rate) : null,
+      is_igst: exForStorage.is_igst ?? null,
+      place_of_supply: exForStorage.place_of_supply ?? null,
+      hsn_sac: exForStorage.hsn_sac ?? null,
+      description: exForStorage.description ?? null,
+      line_items: exForStorage.line_items ?? null,
 
       // TDS — not calculated yet, set after review
       tds_applicable: false,
       tds_rate: null,
       tds_amount: null,
-      net_payable: ex.amount != null ? Number(ex.amount) : null,
+      net_payable: exForStorage.amount != null ? Number(exForStorage.amount) : null,
 
       // Meta
-      confidence_score: ex.confidence_score != null ? Number(ex.confidence_score) : null,
+      confidence_score: exForStorage.confidence_score != null ? Number(exForStorage.confidence_score) : null,
       extraction_method: ex.extraction_method ?? null, // CHANGED — records which model path was used
       source,
       status: "pending",
@@ -110,12 +113,14 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
 
     // 5. Insert invoice
     console.log("Step 4: Saving to database...");
+    console.time("supabase-insert");
+
     const { data, error } = await supabase
       .from("invoices")
       .insert([record])
       .select()
       .single();
-
+    console.timeEnd("supabase-insert");
     if (error) {
       // CHANGED — duplicate invoice now gets a clear, specific error
       // once the UNIQUE constraint from the migration file is in place.

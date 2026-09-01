@@ -9,7 +9,12 @@ const PORT = process.env.PORT ?? 3000;
 
 // ── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:4173', 'http://localhost:3000', 'https://finance-dv19xdg2y-codercanvaslab-projects.vercel.app/'],
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:4173',
+    'http://localhost:3000',
+    'https://vendoreflow.vercel.app' // custom Vercel domain — no trailing slash (CORS origin match is exact; browsers never send a trailing slash in the Origin header)
+  ],
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));

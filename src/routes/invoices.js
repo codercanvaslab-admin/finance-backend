@@ -1,14 +1,23 @@
 // src/routes/invoices.js
 // ─────────────────────────────────────────────────────────────
-// POST /api/extract-invoice  — extract + auto-match vendor + calculate TDS
-// PATCH /api/invoices/:id/approve — approve + update TDS ledger
-// PATCH /api/invoices/:id/reject  — reject invoice
-// GET   /api/invoices             — list invoices with filters
+// CHANGES FROM THE ORIGINAL FILE (marked with "// CHANGED:"):
+//   1. Uses extractionService.js instead of geminiService.js directly
+//      → now handles images and scanned PDFs, not just clean PDFs.
+//   2. Runs validateTaxType() after extraction → independently checks
+//      the AI's CGST/SGST/IGST decision against GSTIN state codes,
+//      and checks the math balances.
+//   3. If validation flags anything, the invoice is force-flagged for
+//      review (status stays "pending" with a visible reason) even if
+//      the AI's own confidence score was high — a high-confidence AI
+//      guess and an independently-verified fact are not the same thing.
+//   4. Duplicate invoices now return a clear 409 error instead of a
+//      generic 500, once the DB constraint (see migration file) exists.
 // ─────────────────────────────────────────────────────────────
 
 import { Router } from "express";
 import multer from "multer";
-import { extractInvoice } from "../services/geminiService.js";
+import { extractInvoice } from "../services/extractionService.js"; // CHANGED
+import { validateTaxType } from "../services/taxValidation.js";     // CHANGED
 import { findOrCreateVendor, calculateTDS, updateTDSLedger, getFYFromDate } from "../services/vendorServices.js";
 import supabase from "../config/supabase.js";
 
@@ -35,16 +44,28 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
     const { buffer, mimetype } = req.file;
     const source = req.body.source ?? "manual";
 
-    // 1. Extract invoice fields via AI
+    // 1. Extract invoice fields via AI (now routes to text OR vision automatically)
     console.log("Step 1: Extracting invoice data...");
-    const ex = await extractInvoice(buffer, mimetype);
+    const ex = await extractInvoice(buffer, mimetype); // CHANGED
 
-    // 2. Auto-match or create vendor
-    console.log("Step 2: Matching vendor...");
+    // 2. CHANGED — Independent, deterministic tax-type + math validation
+    console.log("Step 2: Validating tax type and math...");
+    const validation = validateTaxType(ex);
+    if (!validation.passed) {
+      console.warn("Tax validation flags:", validation.flags.map((f) => f.code).join(", "));
+    }
+
+    // 3. Auto-match or create vendor
+    console.log("Step 3: Matching vendor...");
     const { vendor, isNew } = await findOrCreateVendor(ex);
 
-    // 3. Build invoice record (no TDS yet — finance team picks section on review)
+    // 4. Build invoice record (no TDS yet — finance team picks section on review)
     const fy = getFYFromDate(ex.invoice_date);
+
+    // CHANGED — if the model's own confidence was high but our independent
+    // check found a problem, don't let the high AI confidence silently win.
+    // We store both, and force needs_review when validation fails.
+    const forcedReview = !validation.passed;
 
     const record = {
       // Core
@@ -77,15 +98,18 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       net_payable: ex.amount != null ? Number(ex.amount) : null,
 
       // Meta
-      confidence_score: ex.confidence != null ? Number(ex.confidence) : null,
+      confidence_score: ex.confidence_score != null ? Number(ex.confidence_score) : null,
+      extraction_method: ex.extraction_method ?? null, // CHANGED — records which model path was used
       source,
       status: "pending",
       payment_status: "unpaid",
+      needs_review: forcedReview,                       // CHANGED
+      validation_flags: validation.flags,                // CHANGED — stored so the Review UI can show *why*
       raw_data: ex,
     };
 
-    // 4. Insert invoice
-    console.log("Step 3: Saving to database...");
+    // 5. Insert invoice
+    console.log("Step 4: Saving to database...");
     const { data, error } = await supabase
       .from("invoices")
       .insert([record])
@@ -93,6 +117,14 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       .single();
 
     if (error) {
+      // CHANGED — duplicate invoice now gets a clear, specific error
+      // once the UNIQUE constraint from the migration file is in place.
+      if (error.code === "23505") {
+        return res.status(409).json({
+          error: "This invoice has already been uploaded (same vendor + invoice number).",
+          details: error.message,
+        });
+      }
       console.error("Supabase insert error:", error);
       return res.status(500).json({ error: "Failed to save invoice.", details: error.message });
     }
@@ -101,6 +133,7 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       ...data,
       vendor,
       vendorIsNew: isNew,
+      validation, // CHANGED — frontend can show the specific flags immediately
     });
 
   } catch (err) {

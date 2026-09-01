@@ -1,3 +1,16 @@
+// src/services/geminiService.js
+// ─────────────────────────────────────────────────────────────
+// NOTE ON THE FILENAME: despite the name, this file talks to GROQ
+// (Llama 3.3 70B), not Gemini — that was a naming mistake from an
+// earlier version. Kept as-is here to avoid breaking any existing
+// imports elsewhere in the project; consider renaming to
+// `groqTextService.js` in your own repo when convenient.
+//
+// Handles CLEAN, TEXT-BASED PDFs only (has a real text layer, e.g.
+// a digitally-generated invoice). For photos/scans, see
+// visionService.js + extractionService.js.
+// ─────────────────────────────────────────────────────────────
+
 import Groq from "groq-sdk";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
@@ -27,32 +40,32 @@ Fields to extract:
 
 Return null for missing fields. Never guess.`;
 
-export async function extractInvoice(fileBuffer, mimeType) {
-  let textContent = null;
-
-  // Extract text from PDF
-  if (mimeType === "application/pdf") {
-    try {
-      const loadingTask = getDocument({ data: new Uint8Array(fileBuffer) });
-      const pdfDoc = await loadingTask.promise;
-      const pages = [];
-      for (let i = 1; i <= pdfDoc.numPages; i++) {
-        const page = await pdfDoc.getPage(i);
-        const content = await page.getTextContent();
-        pages.push(content.items.map((item) => item.str).join(" "));
-      }
-      textContent = pages.join("\n");
-      console.log(`✓ PDF text extracted (${textContent.length} chars)`);
-    } catch (err) {
-      throw new Error(`PDF text extraction failed: ${err.message}`);
-    }
+/**
+ * Pulls the raw text layer out of a PDF. Returns an empty/short string
+ * for scanned PDFs that have no real text layer (just an image of a page).
+ */
+export async function extractPdfText(fileBuffer) {
+  const loadingTask = getDocument({ data: new Uint8Array(fileBuffer) });
+  const pdfDoc = await loadingTask.promise;
+  const pages = [];
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    const page = await pdfDoc.getPage(i);
+    const content = await page.getTextContent();
+    pages.push(content.items.map((item) => item.str).join(" "));
   }
+  const textContent = pages.join("\n");
+  console.log(`PDF text layer extracted (${textContent.length} chars)`);
+  return textContent;
+}
 
-  if (!textContent) {
-    throw new Error("Only PDF invoices supported. Please upload a PDF.");
-  }
-
-  console.log("Calling Groq API...");
+/**
+ * Sends already-extracted invoice text to Groq (Llama 3.3 70B) for
+ * structured extraction. This is the cheap, fast path — use it only
+ * when extractPdfText() returned meaningful text (see extractionService.js
+ * for the threshold check).
+ */
+export async function extractInvoiceFromText(textContent) {
+  console.log("Calling Groq API (text extraction)...");
 
   const response = await client.chat.completions.create({
     model: "llama-3.3-70b-versatile",
@@ -81,9 +94,25 @@ export async function extractInvoice(fileBuffer, mimeType) {
 
   try {
     const parsed = JSON.parse(cleaned);
-    console.log(`✓ Success: ${parsed.vendor_name} | ₹${parsed.amount}`);
+    console.log(`✓ Groq success: ${parsed.vendor_name} | ₹${parsed.amount}`);
     return parsed;
   } catch {
     throw new Error(`Failed to parse JSON: ${content}`);
   }
+}
+
+/**
+ * Kept for backward compatibility with any code still calling the old
+ * combined function directly. New code should use extractionService.js
+ * instead, which also handles images/scans.
+ */
+export async function extractInvoice(fileBuffer, mimeType) {
+  if (mimeType !== "application/pdf") {
+    throw new Error("Only PDF invoices supported by this function. Use extractionService.js for images.");
+  }
+  const textContent = await extractPdfText(fileBuffer);
+  if (!textContent) {
+    throw new Error("Only PDF invoices supported. Please upload a PDF.");
+  }
+  return extractInvoiceFromText(textContent);
 }

@@ -20,6 +20,7 @@
     "groq-sdk": "^1.2.1",
     "multer": "^1.4.5-lts.1",
     "node-fetch": "^3.3.2",
+    "pdf-to-png-converter": "^4.2.1",
     "pdfjs-dist": "^5.7.284"
   },
   "devDependencies": {

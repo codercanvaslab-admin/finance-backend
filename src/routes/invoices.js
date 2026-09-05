@@ -16,6 +16,7 @@
 
 import { Router } from "express";
 import multer from "multer";
+import { randomUUID } from "crypto";
 import { extractInvoice } from "../services/extractionService.js"; // CHANGED
 import { validateTaxType } from "../services/taxValidation.js";     // CHANGED
 import { findOrCreateVendor, calculateTDS, updateTDSLedger, getFYFromDate } from "../services/vendorServices.js";
@@ -23,6 +24,52 @@ import supabase from "../config/supabase.js";
 import { suggestTDSSection } from "../services/tdsSuggestionService.js";
 
 const router = Router();
+
+// ── File storage ────────────────────────────────────────────
+// NEW — the uploaded file was previously only held in memory long
+// enough to run extraction, then thrown away. `file_url`/`file_type`
+// were never written to the DB, which is why the Review screen always
+// showed "No file preview" and the "Re-run AI" button was permanently
+// disabled (it's gated on `invoice.file_url` existing).
+//
+// This uploads the original file to a Supabase Storage bucket and
+// returns a public URL to store on the invoice row.
+//
+// REQUIRES a bucket named "invoice-files" to exist in the Supabase
+// project's Storage settings, set to Public. Create it once via:
+// Supabase Dashboard → Storage → New bucket → name "invoice-files" →
+// toggle "Public bucket" on. This can't be created from this codebase
+// automatically — same "written but not applied" trap as a migration,
+// so verify it exists before assuming this feature works.
+//
+// NOTE: using a public bucket is a stopgap for MVP simplicity, since
+// the frontend reads invoice rows (and would need the file URL)
+// directly from Supabase, not through this backend. Invoices contain
+// GSTIN and financial details — before onboarding real firms, revisit
+// this in favor of signed URLs generated on demand, scoped per firm
+// once multi-tenancy (org_id) exists.
+const STORAGE_BUCKET = "invoice-files";
+
+async function uploadInvoiceFile(buffer, mimetype) {
+  const ext = mimetype === "application/pdf" ? "pdf" : mimetype === "image/png" ? "png" : "jpg";
+  const path = `${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${ext}`;
+
+  const { error: uploadErr } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(path, buffer, { contentType: mimetype, upsert: false });
+
+  if (uploadErr) {
+    // Don't fail the whole extraction over a storage problem (e.g. the
+    // bucket not existing yet) — log loudly and continue without a
+    // preview/rerun capability for this invoice, same "degrade, don't
+    // crash" pattern used elsewhere in this route.
+    console.error(`Storage upload failed (bucket "${STORAGE_BUCKET}" missing/misconfigured?):`, uploadErr.message);
+    return { file_url: null, file_type: null };
+  }
+
+  const { data: publicUrlData } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
+  return { file_url: publicUrlData?.publicUrl ?? null, file_type: mimetype };
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -44,6 +91,14 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
 
     const { buffer, mimetype } = req.file;
     const source = req.body.source ?? "manual";
+    // NEW — when set, this is a "Re-run AI" call from the Review screen:
+    // update the existing invoice row in place instead of inserting a new
+    // one. (Previously the frontend called this same endpoint, got back a
+    // brand-new row, then deleted it and copied fields onto the original —
+    // a workaround for this endpoint not supporting updates. Handling it
+    // here is more direct and avoids a duplicate-key race against the
+    // duplicate check below, since the "existing" row IS this invoice.)
+    const reextractId = req.body.reextract_id ? Number(req.body.reextract_id) : null;
 
     // 1. Extract invoice fields via AI (now routes to text OR vision automatically)
     console.log("Step 1: Extracting invoice data...");
@@ -66,6 +121,12 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
     // 3.5 NEW — AI suggests a TDS section (human still confirms at approval time)
     console.log("Step 3.5: Suggesting TDS section...");
     const tdsSuggestion = await suggestTDSSection(exForStorage);
+
+    // 3.6 NEW — store the original file so the Review screen can show a
+    // preview and "Re-run AI" has something to re-fetch. See
+    // uploadInvoiceFile() above for the required Supabase Storage setup.
+    console.log("Step 3.6: Uploading file to storage...");
+    const { file_url, file_type } = await uploadInvoiceFile(buffer, mimetype);
 
     // 4. Build invoice record (no TDS yet — finance team picks section on review)
     const fy = getFYFromDate(exForStorage.invoice_date);
@@ -107,37 +168,74 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       suggested_tds_section_id: tdsSuggestion.suggested_section_id,   // NEW
       suggested_tds_reasoning: tdsSuggestion.reasoning,
 
+      // File
+      file_url,   // NEW
+      file_type,  // NEW
+
       // Meta
       confidence_score: exForStorage.confidence_score != null ? Number(exForStorage.confidence_score) : null,
       extraction_method: ex.extraction_method ?? null, // CHANGED — records which model path was used
       source,
       status: "pending",
       payment_status: "unpaid",
-      needs_review: forcedReview,                       // CHANGED
+      // CHANGED — needs_review now also fires on low AI self-reported
+      // confidence (<90%), not just failed deterministic validation.
+      // Confidence here is the model's own guess at how sure it is,
+      // not a computed metric — so a below-90% self-report is worth a
+      // human's attention even when nothing else flagged.
+      needs_review: forcedReview || (exForStorage.confidence_score != null && Number(exForStorage.confidence_score) < 0.9),
       validation_flags: validation.flags,                // CHANGED — stored so the Review UI can show *why*
       raw_data: ex,
     };
 
-    // 5. Insert invoice
-    console.log("Step 4: Saving to database...");
-    console.time("supabase-insert");
+    // 4.5 NEW — duplicate check at the application layer, not just the
+    // DB constraint. Defense-in-depth: the migration that adds the
+    // UNIQUE index (2002605300002) has to actually be *run* against the
+    // live Supabase project to take effect — per CLAUDE.md, this repo
+    // has a history of a migration file existing but never being
+    // applied, silently leaving the bug live. This check works
+    // regardless of whether that index exists yet, and also lets
+    // "Re-run AI" (which re-submits the same invoice_number/vendor_gstin
+    // for an existing row) exclude itself instead of flagging as its
+    // own duplicate.
+    if (record.vendor_gstin && record.invoice_number) {
+      let dupQuery = supabase
+        .from("invoices")
+        .select("id")
+        .eq("vendor_gstin", record.vendor_gstin)
+        .eq("invoice_number", record.invoice_number);
+      if (reextractId) dupQuery = dupQuery.neq("id", reextractId);
 
-    const { data, error } = await supabase
-      .from("invoices")
-      .insert([record])
-      .select()
-      .single();
-    console.timeEnd("supabase-insert");
+      const { data: dupes, error: dupErr } = await dupQuery.limit(1);
+      if (dupErr) console.warn("Duplicate pre-check failed (continuing, DB constraint is the fallback):", dupErr.message);
+      if (dupes && dupes.length > 0) {
+        return res.status(409).json({
+          error: "This invoice has already been uploaded (same vendor + invoice number).",
+        });
+      }
+    }
+
+    // 5. Insert (or, for a re-run, update the existing row in place)
+    console.log(reextractId ? "Step 4: Updating existing invoice..." : "Step 4: Saving to database...");
+    console.time("supabase-write");
+
+    const { data, error } = reextractId
+      ? await supabase.from("invoices").update(record).eq("id", reextractId).select().single()
+      : await supabase.from("invoices").insert([record]).select().single();
+
+    console.timeEnd("supabase-write");
     if (error) {
       // CHANGED — duplicate invoice now gets a clear, specific error
       // once the UNIQUE constraint from the migration file is in place.
+      // (Kept as a second layer behind the pre-check above, in case of
+      // a race between two near-simultaneous uploads.)
       if (error.code === "23505") {
         return res.status(409).json({
           error: "This invoice has already been uploaded (same vendor + invoice number).",
           details: error.message,
         });
       }
-      console.error("Supabase insert error:", error);
+      console.error("Supabase write error:", error);
       // CHANGED — lead with the actual database error, not a generic
       // wrapper. "Failed to save invoice." tells you nothing; the
       // Postgres message (e.g. a constraint violation, a bad column
@@ -148,7 +246,7 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       });
     }
 
-    return res.status(201).json({
+    return res.status(reextractId ? 200 : 201).json({
       ...data,
       vendor,
       vendorIsNew: isNew,

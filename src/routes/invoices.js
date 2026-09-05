@@ -20,6 +20,7 @@ import { extractInvoice } from "../services/extractionService.js"; // CHANGED
 import { validateTaxType } from "../services/taxValidation.js";     // CHANGED
 import { findOrCreateVendor, calculateTDS, updateTDSLedger, getFYFromDate } from "../services/vendorServices.js";
 import supabase from "../config/supabase.js";
+import { suggestTDSSection } from "../services/tdsSuggestionService.js";
 
 const router = Router();
 
@@ -62,6 +63,10 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
     console.log("Step 3: Matching vendor...");
     const { vendor, isNew } = await findOrCreateVendor(exForStorage);
 
+    // 3.5 NEW — AI suggests a TDS section (human still confirms at approval time)
+    console.log("Step 3.5: Suggesting TDS section...");
+    const tdsSuggestion = await suggestTDSSection(exForStorage);
+
     // 4. Build invoice record (no TDS yet — finance team picks section on review)
     const fy = getFYFromDate(exForStorage.invoice_date);
 
@@ -99,6 +104,8 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       tds_rate: null,
       tds_amount: null,
       net_payable: exForStorage.amount != null ? Number(exForStorage.amount) : null,
+      suggested_tds_section_id: tdsSuggestion.suggested_section_id,   // NEW
+      suggested_tds_reasoning: tdsSuggestion.reasoning,
 
       // Meta
       confidence_score: exForStorage.confidence_score != null ? Number(exForStorage.confidence_score) : null,
@@ -131,7 +138,14 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
         });
       }
       console.error("Supabase insert error:", error);
-      return res.status(500).json({ error: "Failed to save invoice.", details: error.message });
+      // CHANGED — lead with the actual database error, not a generic
+      // wrapper. "Failed to save invoice." tells you nothing; the
+      // Postgres message (e.g. a constraint violation, a bad column
+      // type) tells you exactly what to fix.
+      return res.status(500).json({
+        error: `Failed to save invoice: ${error.message}`,
+        code: error.code ?? null,
+      });
     }
 
     return res.status(201).json({

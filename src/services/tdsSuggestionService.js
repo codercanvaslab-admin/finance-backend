@@ -43,7 +43,16 @@ export async function suggestTDSSection(invoice) {
     .filter(Boolean)
     .join("; ");
 
+  const hsnSac = invoice.hsn_sac || null;
   const textToClassify = [description, lineItemDescriptions].filter(Boolean).join(". ");
+
+  const hsnContext = hsnSac
+    ? `\nHSN/SAC code on the invoice: ${hsnSac}. Use this as a secondary signal alongside
+       the description — e.g. a services SAC code (99xxxx) with generic "technical"-sounding
+       wording is not automatically 194J; a plain subscription/portal-access/advertisement-style
+       service (no professional or technical expertise actually rendered) is often more
+       appropriately 194C than 194J, even if the description mentions technology.`
+    : "";
 
   if (!textToClassify.trim()) {
     // Nothing to classify from — don't guess with no input.
@@ -57,7 +66,7 @@ export async function suggestTDSSection(invoice) {
   const prompt = `You are helping a CA firm classify an invoice for Indian TDS (Tax Deducted at Source) purposes.
 
 Invoice description: "${textToClassify}"
-
+${hsnContext}
 Available TDS sections (pick the single best match, or say NONE if this
 clearly doesn't need TDS at all — e.g. a goods purchase under the 194Q
 threshold, or a payment type not covered by any listed section):

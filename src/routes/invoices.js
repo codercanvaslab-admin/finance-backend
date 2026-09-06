@@ -22,6 +22,7 @@ import { validateTaxType } from "../services/taxValidation.js";     // CHANGED
 import { findOrCreateVendor, calculateTDS, updateTDSLedger, getFYFromDate } from "../services/vendorServices.js";
 import supabase from "../config/supabase.js";
 import { suggestTDSSection } from "../services/tdsSuggestionService.js";
+import { checkUsageLimit, recordUsage, getUsageStatus, UsageLimitError } from "../services/usageService.js"; // NEW
 
 const router = Router();
 
@@ -89,6 +90,17 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       return res.status(400).json({ error: "No file uploaded. Use field name 'invoice'." });
     }
 
+    // NEW — check the org's monthly plan limit BEFORE spending money on
+    // an AI call. req.orgId is set by requireAuth middleware (index.js).
+    try {
+      await checkUsageLimit(req.orgId);
+    } catch (err) {
+      if (err instanceof UsageLimitError) {
+        return res.status(402).json({ error: err.message, code: err.code }); // 402 Payment Required
+      }
+      throw err;
+    }
+
     const { buffer, mimetype } = req.file;
     const source = req.body.source ?? "manual";
     // NEW — when set, this is a "Re-run AI" call from the Review screen:
@@ -137,6 +149,7 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
     const forcedReview = !validation.passed;
 
     const record = {
+      org_id: req.orgId,
       // Core
       vendor_id: vendor.id,
       vendor_name: exForStorage.vendor_name ?? null,
@@ -246,6 +259,12 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
       });
     }
 
+    // NEW — count this against the org's monthly usage (skip on a
+    // re-run — that's re-processing an existing invoice, not a new one)
+    if (!reextractId) {
+      await recordUsage(req.orgId, req.file.size);
+    }
+
     return res.status(reextractId ? 200 : 201).json({
       ...data,
       vendor,
@@ -273,6 +292,7 @@ router.patch("/invoices/:id/approve", async (req, res) => {
       .from("invoices")
       .select("*")
       .eq("id", id)
+      .eq("org_id", req.orgId)
       .single();
 
     if (fetchErr || !invoice) {
@@ -373,6 +393,7 @@ router.get("/invoices", async (req, res) => {
     let query = supabase
       .from("invoices")
       .select("*, vendors(company_name, gstin, pan, vendor_type)", { count: "exact" })
+      .eq("org_id", req.orgId)
       .order("created_at", { ascending: false })
       .range(Number(offset), Number(offset) + Number(limit) - 1);
 
@@ -400,6 +421,7 @@ router.get("/invoices/:id", async (req, res) => {
       .from("invoices")
       .select("*, vendors(*), tds_sections(*)")
       .eq("id", req.params.id)
+      .eq("org_id", req.orgId)
       .single();
 
     if (error) return res.status(404).json({ error: "Invoice not found." });
@@ -410,5 +432,17 @@ router.get("/invoices/:id", async (req, res) => {
   }
 });
 
+// ── GET /api/usage ─────────────────────────────────────────────
+// NEW — powers the "42/50 invoices used this month" indicator on the
+// frontend, and is what the Upload page should check before letting
+// someone add more files to the queue.
+router.get("/usage", async (req, res) => {
+  try {
+    const status = await getUsageStatus(req.orgId);
+    return res.json(status);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 export default router;

@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import invoiceRoutes from "./routes/invoices.js";
 import vendorRoutes from "./routes/vendors.js";
+import { requireAuth } from "./middleware/requireAuth.js"; // NEW
 
 const app = express();
 const PORT = process.env.PORT ?? 3000;
@@ -22,8 +23,13 @@ app.use(express.json());
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
-app.use("/api", invoiceRoutes);
-app.use("/api", vendorRoutes);
+
+// NEW — requireAuth runs before every invoice/vendor route, attaching
+// req.orgId/req.userId/req.userRole. Health check stays public (no
+// login needed to confirm the server is alive); everything else now
+// requires a valid Supabase session AND a linked organization.
+app.use("/api", requireAuth, invoiceRoutes);
+app.use("/api", requireAuth, vendorRoutes);
 
 // ── Global error handler ────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars

@@ -25,6 +25,7 @@ router.get("/vendors", async (req, res) => {
         let query = supabase
             .from("vendor_payment_summary")
             .select("*")
+            .eq("org_id", req.orgId)
             .order("company_name", { ascending: true });
 
         const { data, error } = await query;
@@ -60,6 +61,7 @@ router.get("/vendors/:id", async (req, res) => {
             .from("vendors")
             .select("*")
             .eq("id", req.params.id)
+            .eq("org_id", req.orgId)
             .single();
 
         if (error) return res.status(404).json({ error: "Vendor not found." });
@@ -106,6 +108,7 @@ router.post("/vendors", async (req, res) => {
         const { data, error } = await supabase
             .from("vendors")
             .insert({
+                org_id: req.orgId,
                 company_name, gstin: gstin || null, pan: pan || null,
                 vendor_type: vendor_type || "company",
                 email: email || null, phone: phone || null,
@@ -164,6 +167,7 @@ router.patch("/vendors/:id", async (req, res) => {
             .from("vendors")
             .update(updates)
             .eq("id", req.params.id)
+            .eq("org_id", req.orgId)
             .select()
             .single();
 
@@ -185,6 +189,7 @@ router.get("/vendors/:id/invoices", async (req, res) => {
             .from("invoices")
             .select("*")
             .eq("vendor_id", req.params.id)
+            .eq("org_id", req.orgId)
             .order("invoice_date", { ascending: false });
 
         if (financial_year) query = query.eq("financial_year", financial_year);
@@ -209,6 +214,7 @@ router.get("/vendors/:id/tds", async (req, res) => {
             .from("vendor_tds_ledger")
             .select("*, tds_sections(section, sub_type, nature_of_payment, threshold_aggregate, rate_individual, rate_company)")
             .eq("vendor_id", req.params.id)
+            .eq("org_id", req.orgId)
             .order("financial_year", { ascending: false });
 
         if (financial_year) query = query.eq("financial_year", financial_year);

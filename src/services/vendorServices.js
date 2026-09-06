@@ -44,16 +44,19 @@ export function getFYFromDate(dateStr) {
  * Finds existing vendor by GSTIN, or creates a new one.
  * Returns { vendor, isNew }
  */
-export async function findOrCreateVendor(extracted) {
+export async function findOrCreateVendor(extracted, orgId) {
     const gstin = extracted.vendor_gstin ?? null;
     const name = extracted.vendor_name ?? "Unknown Vendor";
 
-    // 1a. Try to find by GSTIN (most reliable — unique)
+    // 1a. Try to find by GSTIN (most reliable — unique) — CHANGED: scoped
+    // to this org, so Firm A and Firm B each get their own vendor record
+    // for the same real-world supplier, matching their own TDS ledgers.
     if (gstin) {
         const { data: existing } = await supabase
             .from("vendors")
             .select("*")
             .eq("gstin", gstin)
+            .eq("org_id", orgId) // NEW
             .maybeSingle();
 
         if (existing) {
@@ -75,7 +78,8 @@ export async function findOrCreateVendor(extracted) {
         const normalised = name.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
         const { data: allVendors } = await supabase
             .from("vendors")
-            .select("id, company_name, gstin");
+            .select("id, company_name, gstin")
+            .eq("org_id", orgId); // NEW — same org-scoping
 
         const match = (allVendors ?? []).find((v) => {
             const vNorm = v.company_name.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
@@ -99,6 +103,7 @@ export async function findOrCreateVendor(extracted) {
 
     // 1c. No match — create new vendor from extracted data
     const newVendor = {
+        org_id: orgId, // NEW — tag every new vendor to the creating firm
         company_name: name,
         gstin: gstin ?? null,
         pan: extracted.pan ?? null,

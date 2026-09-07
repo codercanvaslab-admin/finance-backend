@@ -102,12 +102,43 @@ export async function findOrCreateVendor(extracted, orgId) {
     }
 
     // 1c. No match — create new vendor from extracted data
+    //
+    // FIXED (this session) — two compounding bugs found while investigating
+    // §7's "GSTIN-less vendor + TDS, not yet confirmed" gap and §8b.5's
+    // "TDS preview always uses rate_company" gap. Root cause of BOTH:
+    //   1. Neither extraction prompt (geminiService.js / visionService.js)
+    //      ever asked the AI for a vendor PAN field — `extracted.pan` was
+    //      ALWAYS undefined, so `vendors.pan` has been null for every
+    //      vendor ever created, and calculateTDS()'s `hasPan` check has
+    //      always been false → EVERY invoice's TDS has been calculated at
+    //      the punitive rate_no_pan (typically 20%), never the correct
+    //      rate_individual/rate_company, regardless of how the invoice
+    //      actually looked.
+    //   2. deriveVendorType()'s old GSTIN-character check read gstin[9] —
+    //      off by 4 from the actual entity-type character. A GSTIN embeds
+    //      a full 10-char PAN at positions 3-12 (1-indexed), and PAN's
+    //      entity-type character is its 4th character — landing at GSTIN
+    //      index 5 (0-indexed), not 9. index 9 falls inside the PAN's
+    //      numeric sequence, so it was reading a digit, never matching
+    //      "P"/"F"/"B"/"T", and silently defaulting every vendor —
+    //      GSTIN-less or not — to "company".
+    //
+    // Fix: a GSTIN already contains a full, valid PAN — derive it directly
+    // (gstin.slice(2, 12)) instead of relying on a field the AI was never
+    // asked for, and fix the entity-type character to the correct index
+    // within that derived PAN. Genuinely GSTIN-less AND PAN-less vendors
+    // (e.g. an unregistered freelancer with no GSTIN, and no PAN visible
+    // on the invoice either) correctly still fall through to hasPan=false
+    // and the no-PAN rate — that is the legally correct outcome for that
+    // specific case, not a bug.
+    const derivedPan = extracted.pan ?? derivePanFromGstin(gstin);
+
     const newVendor = {
         org_id: orgId, // NEW — tag every new vendor to the creating firm
         company_name: name,
         gstin: gstin ?? null,
-        pan: extracted.pan ?? null,
-        vendor_type: deriveVendorType(gstin),
+        pan: derivedPan,
+        vendor_type: deriveVendorType(derivedPan),
         email: extracted.vendor_email ?? null,
         phone: extracted.vendor_phone ?? null,
         address: extracted.vendor_address ?? null,
@@ -129,19 +160,39 @@ export async function findOrCreateVendor(extracted, orgId) {
 }
 
 /**
- * Derives vendor type from GSTIN structure.
- * 10th char of GSTIN indicates entity type:
- *   1-9 / A-H / Z = Company/others
- *   P             = Individual / Proprietor
+ * Extracts the PAN embedded within a valid 15-character GSTIN.
+ * GSTIN structure: [2-digit state code][10-char PAN][entity code][default 'Z'][checksum]
+ * — the PAN occupies characters 3-12 (1-indexed), i.e. gstin.slice(2, 12).
  */
-function deriveVendorType(gstin) {
-    if (!gstin || gstin.length !== 15) return "company";
-    const char = gstin[9].toUpperCase();
+function derivePanFromGstin(gstin) {
+    if (!gstin || gstin.length !== 15) return null;
+    return gstin.slice(2, 12).toUpperCase();
+}
+
+/**
+ * Derives vendor type from a PAN's 4th character (standard Indian PAN
+ * structure — this position always indicates holder type, regardless of
+ * whether the PAN came from a standalone field or was extracted from a
+ * GSTIN via derivePanFromGstin() above):
+ *   P = Individual   F = Firm        H = HUF (grouped with Individual —
+ *   C = Company      T = Trust           tds_sections' own rows use
+ *   A = AOP          B = BOI             "Individual/HUF" as a combined
+ *   L = Local Authority   G = Government  category — see §8c)
+ *   J = Artificial Juridical Person
+ *
+ * NOTE: AOP/BOI/Trust/Local Authority/Government/Artificial-Juridical are
+ * mapped to the "company" (non-individual) rate bucket below, matching
+ * this codebase's existing binary rate_individual vs rate_company split
+ * in calculateTDS(). This is an assumption, not a confirmed CA ruling —
+ * flagged for the CA questions list.
+ */
+function deriveVendorType(pan) {
+    if (!pan || pan.length !== 10) return "company";
+    const char = pan[3].toUpperCase();
     if (char === "P") return "individual";
+    if (char === "H") return "individual"; // HUF — grouped with Individual, see note above
     if (char === "F") return "firm";
-    if (char === "B") return "boi"; // Body of Individuals
-    if (char === "T") return "trust";
-    return "company";
+    return "company"; // C, A, B, T, L, J, G, or unrecognized — safest default
 }
 
 // ── 2. TDS Calculation ────────────────────────────────────────

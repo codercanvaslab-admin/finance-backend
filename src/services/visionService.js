@@ -4,17 +4,28 @@
 //   - Photographed invoices (JPG/PNG from WhatsApp, phone camera)
 //   - Scanned PDFs (no embedded text, just a picture of a page)
 //
-// Uses Gemini 2.5 Flash's vision capability — it reads the image
-// directly, the same way a human would look at a photo of a bill.
+// Uses Gemini's vision capability — it reads the image directly,
+// the same way a human would look at a photo of a bill.
 //
 // This is a NEW file. It does not replace geminiService.js (which
 // still handles clean, text-based PDFs cheaply via Groq) — see
 // extractionService.js for how the two are combined.
+//
+// CHANGED — model deprecation found this session, same class of
+// issue as the Groq one in §5/§8j: "gemini-2.5-flash" was hardcoded
+// here and is no longer available to new API keys/projects (Google
+// points new users at gemini-3.6-flash instead — existing
+// grandfathered keys may still work on 2.5-flash for a while, but
+// new ones get a 404 immediately). Moved the model name into a
+// GEMINI_MODEL env var (defaulting to the current gemini-3.6-flash)
+// so the next Gemini-side deprecation is a Railway variable change,
+// not an emergency code deploy.
 // ─────────────────────────────────────────────────────────────
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
 // Same field list as geminiService.js's EXTRACT_PROMPT, kept identical
 // on purpose — both paths must return the exact same shape so the rest
@@ -54,16 +65,16 @@ number you cannot actually read on the page.`;
 
 /**
  * Extracts invoice data from an image (JPG/PNG) or a scanned PDF page
- * that's been rasterized to an image, using Gemini 2.5 Flash's vision.
+ * that's been rasterized to an image, using Gemini's vision (model configurable via GEMINI_MODEL).
  *
  * @param {Buffer} imageBuffer - raw image bytes
  * @param {string} mimeType - "image/jpeg" or "image/png"
  * @returns {Promise<object>} same shape as geminiService.js's extractInvoice()
  */
 export async function extractInvoiceFromImage(imageBuffer, mimeType) {
-  console.log("Calling Gemini 2.5 Flash (vision) for image/scanned invoice...");
+  console.log(`Calling Gemini (vision, model: ${GEMINI_MODEL}) for image/scanned invoice...`);
 
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
 
   const imagePart = {
     inlineData: {

@@ -13,10 +13,8 @@
 // short text description, not reading an image.
 // ─────────────────────────────────────────────────────────────
 
-import Groq from "groq-sdk";
 import supabase from "../config/supabase.js";
-
-const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
+import { createChatCompletion } from "./groqClient.js"; // CHANGED — model-chain fallback + transient retry
 
 /**
  * @param {object} invoice - the extracted invoice fields (needs description, line_items)
@@ -79,15 +77,23 @@ Return ONLY valid JSON, no markdown:
 }`;
 
   try {
-    const response = await client.chat.completions.create({
-      model: process.env.GROQ_MODEL_CHAIN?.split(",")[0]?.trim() || "openai/gpt-oss-120b",
-      max_tokens: 300,
-      temperature: 0,
-      messages: [
-        { role: "system", content: "You are a precise TDS classification assistant. Always return only valid JSON." },
-        { role: "user", content: prompt },
-      ],
-    });
+    // CHANGED — routed through groqClient.js instead of calling the SDK
+    // directly and manually reading GROQ_MODEL_CHAIN here. groqClient.js
+    // now owns the full chain (tries each model in order, falls back on
+    // deprecation) AND retries once on transient errors (429/5xx) before
+    // giving up — closes the gap where a single rate-limit blip silently
+    // dropped the suggestion with no retry.
+    const response = await createChatCompletion(
+      {
+        max_tokens: 300,
+        temperature: 0,
+        messages: [
+          { role: "system", content: "You are a precise TDS classification assistant. Always return only valid JSON." },
+          { role: "user", content: prompt },
+        ],
+      },
+      "TDS suggestion"
+    );
 
     const content = response.choices[0]?.message?.content;
     if (!content) throw new Error("No content returned");

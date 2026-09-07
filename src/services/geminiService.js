@@ -1,8 +1,6 @@
 // src/services/geminiService.js
-import Groq from "groq-sdk";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
-
-const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
+import { createChatCompletion } from "./groqClient.js"; // CHANGED — model-chain fallback + transient retry
 
 const EXTRACT_PROMPT = `You are an Indian GST invoice data extractor.
 Return ONLY valid JSON, no markdown, no explanation, no code blocks.
@@ -89,21 +87,27 @@ export async function extractPdfText(fileBuffer) {
 export async function extractInvoiceFromText(textContent) {
   console.log("Calling Groq API (text extraction)...");
 
-  const response = await client.chat.completions.create({
-    model: "openai/gpt-oss-120b",
-    max_tokens: 4096,
-    temperature: 0,
-    messages: [
-      {
-        role: "system",
-        content: "You are a precise invoice data extractor. Always return only valid JSON with no extra text.",
-      },
-      {
-        role: "user",
-        content: `${EXTRACT_PROMPT}\n\nInvoice text:\n\n${textContent}`,
-      },
-    ],
-  });
+  // CHANGED — routed through groqClient.js instead of calling the SDK
+  // directly, so a model deprecation or a transient 429/5xx no longer
+  // breaks extraction outright. See groqClient.js for the full chain
+  // + retry logic.
+  const response = await createChatCompletion(
+    {
+      max_tokens: 4096,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: "You are a precise invoice data extractor. Always return only valid JSON with no extra text.",
+        },
+        {
+          role: "user",
+          content: `${EXTRACT_PROMPT}\n\nInvoice text:\n\n${textContent}`,
+        },
+      ],
+    },
+    "invoice extraction"
+  );
 
   const choice = response.choices[0];
   const content = choice?.message?.content;

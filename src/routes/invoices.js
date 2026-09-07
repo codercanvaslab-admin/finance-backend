@@ -127,8 +127,20 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
     const { _source_text, ...exForStorage } = ex;
 
     // 3. Auto-match or create vendor
+    // FIXED (this session) — findOrCreateVendor(extracted, orgId) requires
+    // orgId to scope both matching and creation to the current firm; it
+    // was never being passed here, so every call ran with orgId = undefined.
+    // Consequence: vendor MATCHING never worked (org_id = undefined never
+    // matches a real UUID), so every upload created a brand-new vendor
+    // row instead of reusing an existing one — and every new vendor row
+    // got org_id = NULL (Supabase's JS client silently drops undefined-
+    // valued keys from an insert payload, so the column was just omitted
+    // rather than erroring). This went unnoticed because the backend's
+    // service-role key bypasses RLS, so the bad NULL inserts never got
+    // blocked. See migration 2002605300009 for the backfill of vendor
+    // rows already created this way.
     console.log("Step 3: Matching vendor...");
-    const { vendor, isNew } = await findOrCreateVendor(exForStorage);
+    const { vendor, isNew } = await findOrCreateVendor(exForStorage, req.orgId);
 
     // 3.5 NEW — AI suggests a TDS section (human still confirms at approval time)
     console.log("Step 3.5: Suggesting TDS section...");
@@ -203,18 +215,30 @@ router.post("/extract-invoice", upload.single("invoice"), async (req, res) => {
 
     // 4.5 NEW — duplicate check at the application layer, not just the
     // DB constraint. Defense-in-depth: the migration that adds the
-    // UNIQUE index (2002605300002) has to actually be *run* against the
-    // live Supabase project to take effect — per CLAUDE.md, this repo
-    // has a history of a migration file existing but never being
-    // applied, silently leaving the bug live. This check works
-    // regardless of whether that index exists yet, and also lets
-    // "Re-run AI" (which re-submits the same invoice_number/vendor_gstin
-    // for an existing row) exclude itself instead of flagging as its
-    // own duplicate.
+    // UNIQUE index (2002605300002, later redefined per-org in 2002605300006)
+    // has to actually be *run* against the live Supabase project to take
+    // effect — per CLAUDE.md, this repo has a history of a migration file
+    // existing but never being applied, silently leaving the bug live.
+    // This check works regardless of whether that index exists yet, and
+    // also lets "Re-run AI" (which re-submits the same
+    // invoice_number/vendor_gstin for an existing row) exclude itself
+    // instead of flagging as its own duplicate.
+    //
+    // FIXED (this session) — this query was missing an org_id filter,
+    // so it was checking for duplicates GLOBALLY across every firm using
+    // the app, not just within the current org. Two unrelated firms
+    // sharing a vendor (common — the same electrician, IT vendor, SaaS
+    // subscription, etc.) with coincidentally matching invoice numbers
+    // would have the second firm's genuinely distinct invoice wrongly
+    // rejected. The DB-level unique index was already correctly scoped
+    // per-org in migration 2002605300006 (idx_unique_invoice_per_org_vendor
+    // on (org_id, vendor_gstin, invoice_number)) — this app-layer
+    // pre-check just hadn't been updated to match it.
     if (record.vendor_gstin && record.invoice_number) {
       let dupQuery = supabase
         .from("invoices")
         .select("id")
+        .eq("org_id", req.orgId)
         .eq("vendor_gstin", record.vendor_gstin)
         .eq("invoice_number", record.invoice_number);
       if (reextractId) dupQuery = dupQuery.neq("id", reextractId);
@@ -419,7 +443,16 @@ router.get("/invoices/:id", async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("invoices")
-      .select("*, vendors(*), tds_sections(*)")
+      // CHANGED — disambiguated tds_sections(*) with the !tds_section_id
+      // hint. Required as of migration 2002605300011: once both
+      // tds_section_id and suggested_tds_section_id became real foreign
+      // keys to tds_sections, an unqualified tds_sections(*) embed is
+      // ambiguous to PostgREST (it doesn't know which column to join
+      // through) and throws "more than one relationship was found".
+      // This embeds through the finalized/approved section specifically
+      // — what this endpoint is actually meant to show — not the AI's
+      // suggestion.
+      .select("*, vendors(*), tds_sections!tds_section_id(*)")
       .eq("id", req.params.id)
       .eq("org_id", req.orgId)
       .single();

@@ -39,6 +39,14 @@ Fields to extract:
 - line_items: array of {description, hsn_sac, qty, unit_price, cgst, sgst, igst, total}
 - place_of_supply: string
 - is_igst: boolean
+- tds_note: string or null (NEW — many Indian service invoices print a
+  disclaimer directly on the invoice like "Tax may be deducted at Source
+  (TDS) @ 10% or 2% under 194J/194C" or "TDS as applicable u/s 194C shall
+  be deducted". Capture that sentence verbatim if present anywhere in the
+  text — it's usually near the totals or bank details, separate from the
+  line-item description. This is the single strongest signal for TDS
+  classification when the vendor has stated it themselves; return null if
+  no such note is present, don't infer or paraphrase one.)
 - confidence_score: number between 0 and 1
 
 Return null for missing fields. Never guess.`;

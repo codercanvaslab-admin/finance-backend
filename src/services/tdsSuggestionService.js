@@ -44,6 +44,21 @@ export async function suggestTDSSection(invoice) {
   const hsnSac = invoice.hsn_sac || null;
   const textToClassify = [description, lineItemDescriptions].filter(Boolean).join(". ");
 
+  // NEW — many Indian service invoices state the applicable TDS section
+  // directly on the invoice (e.g. "Tax may be deducted at Source (TDS)
+  // @ 10% or 2% under 194J/194C"). Previously this was never extracted
+  // at all — only the line-item description reached this prompt — so an
+  // invoice could spell out its own TDS section in plain text and still
+  // get no suggestion, if the line-item description alone was too vague
+  // to classify (e.g. "Background Check Package"). When present, this is
+  // the strongest signal available and should take priority.
+  const tdsNoteContext = invoice.tds_note
+    ? `\nThe invoice itself states: "${invoice.tds_note}". Treat this as the
+       strongest signal — if it names or clearly implies one of the sections
+       below, prefer that section over inferring one from the description
+       alone, even if the description alone would have looked ambiguous or NONE.`
+    : "";
+
   const hsnContext = hsnSac
     ? `\nHSN/SAC code on the invoice: ${hsnSac}. Use this as a secondary signal alongside
        the description — e.g. a services SAC code (99xxxx) with generic "technical"-sounding
@@ -52,7 +67,7 @@ export async function suggestTDSSection(invoice) {
        appropriately 194C than 194J, even if the description mentions technology.`
     : "";
 
-  if (!textToClassify.trim()) {
+  if (!textToClassify.trim() && !invoice.tds_note) {
     // Nothing to classify from — don't guess with no input.
     return { suggested_section_id: null, suggested_section_label: null, reasoning: "No description text available to classify." };
   }
@@ -63,7 +78,8 @@ export async function suggestTDSSection(invoice) {
 
   const prompt = `You are helping a CA firm classify an invoice for Indian TDS (Tax Deducted at Source) purposes.
 
-Invoice description: "${textToClassify}"
+Invoice description: "${textToClassify || "(none extracted — see invoice's own TDS note below)"}"
+${tdsNoteContext}
 ${hsnContext}
 Available TDS sections (pick the single best match, or say NONE if this
 clearly doesn't need TDS at all — e.g. a goods purchase under the 194Q

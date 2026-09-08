@@ -69,6 +69,17 @@ function isTransientError(err) {
   return status === 429 || status === 500 || status === 502 || status === 503;
 }
 
+// NEW — Groq can return a 200 with an empty/missing completion (no
+// exception thrown) — e.g. content filtering, a model quirk, or an
+// odd finish_reason. Previously this looked like success to this
+// function, so it was returned as-is; the caller only discovered the
+// content was empty afterward, by which point there was no retry or
+// model-chain fallback left. Marking it retryable here means it now
+// gets the exact same treatment as a 429/5xx.
+function isEmptyContentError(err) {
+  return err?._emptyCompletion === true;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -92,6 +103,19 @@ export async function createChatCompletion(params, callerLabel = "groq call") {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const response = await client.chat.completions.create({ ...params, model });
+
+        // NEW — see isEmptyContentError above. Check this BEFORE returning,
+        // so an empty completion goes through the same retry/fallback path
+        // as a thrown error, instead of silently reaching the caller as a
+        // "successful" response with nothing usable in it.
+        const content = response.choices?.[0]?.message?.content;
+        if (!content) {
+          const finishReason = response.choices?.[0]?.finish_reason ?? "unknown";
+          const err = new Error(`Empty completion returned (finish_reason: ${finishReason})`);
+          err._emptyCompletion = true;
+          throw err;
+        }
+
         if (i > 0 || attempt > 0) {
           console.log(
             `[groqClient] ${callerLabel} succeeded on "${model}" ` +
@@ -110,9 +134,9 @@ export async function createChatCompletion(params, callerLabel = "groq call") {
           break; // no point retrying an unavailable model — next model
         }
 
-        if (isTransientError(err) && attempt === 0) {
+        if ((isTransientError(err) || isEmptyContentError(err)) && attempt === 0) {
           console.warn(
-            `[groqClient] ${callerLabel}: transient error on "${model}" ` +
+            `[groqClient] ${callerLabel}: ${isEmptyContentError(err) ? "empty completion" : "transient error"} on "${model}" ` +
             `(${err.message}) — retrying same model once in 2s.`
           );
           await sleep(2000);
